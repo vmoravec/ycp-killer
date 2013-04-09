@@ -189,13 +189,14 @@ class YastModule
 
   def compile_modules counts
     failed_files = []
-    ordered_modules = BuildOrder.ordered_modules exports
+    # list of full paths
+    ordered_modules = BuildOrder.new(exports).ordered_modules
 
     ordered_modules.each do |file|
       begin
         create_ybc file
       rescue Exception => e
-        Messages.start " * #{file}"
+        Messages.start "  * #{file}"
         Messages.finish "ERROR(other)"
         log_error(file, e)
         counts[:error_other] += 1
@@ -317,21 +318,53 @@ class YastModule
 
 end
 
-# based on ycpmakedep script https://github.com/yast/yast-devtools/blob/master/devtools/bin/ycpmakedep
-module BuildOrder
-  def self.ordered_modules(source_dirs)
-    modules = find_modules source_dirs
-    includes = find_includes source_dirs
+class DFile
+  attr :name                    # name
+  attr :full_path               # string
+  attr :imports                 # list of names
+  attr :includes                # list of names
 
-    fill_module_deps(modules, includes)
-    result = ordered_modules_by_deps(modules)
+  def initialize(name, full_path)
+    @name = name
+    @full_path = full_path
+    @imports = []
+    @includes = []
+  end
+
+end
+
+  # { "lan/dialogs" => { :full_path => "src/include/lan/dialogs.ycp"}, ... }
+
+class DInclude < DFile
+end
+
+  # { "Foo" => { :full_path => "src/modules/Foo.ycp"}, ... }
+  # FIXME "Foo::Bar" -> "Foo/Bar.ycp" ?
+
+class DModule < DFile
+end
+
+
+# based on ycpmakedep script https://github.com/yast/yast-devtools/blob/master/devtools/bin/ycpmakedep
+class BuildOrder
+
+  # @modules  name => DFile
+  # @includes name => DFile
+  def initialize(source_dirs)
+    @modules = find_modules source_dirs
+    @includes = find_includes source_dirs
+  end
+
+  def ordered_modules
+    fill_module_deps
+    result = ordered_modules_by_deps
 
     result.map { |name| modules[name][:full_path] }
   end
 
   private
 
-  def self.find_modules(source_dirs)
+  def find_modules(source_dirs)
     modules = {}
 
     source_dirs.each do |dir|
@@ -339,14 +372,14 @@ module BuildOrder
         relative_path = file.sub(/#{Regexp.escape(dir)}\/modules\//, "")
         module_name = relative_path.sub(/\.ycp$/, "")
 
-        modules[module_name] = { :full_path => file }
+        modules[module_name] = DModule.new(module_name, file)
       end
     end
 
     modules
   end
 
-  def self.find_includes(source_dirs)
+  def find_includes(source_dirs)
     includes = {}
 
     source_dirs.each do |dir|
@@ -354,14 +387,15 @@ module BuildOrder
         relative_path = file.sub(/#{Regexp.escape(dir)}\/include\//, "")
         include_name = relative_path.sub(/\.y(cp|h)$/, "")
 
-        includes[include_name] = { :full_path => file }
+        includes[include_name] = DInclude.new(include_name, file)
       end
     end
 
     includes
   end
 
-  def self.extract_imported_module_files(lines)
+  # return ["Report", "Popup", "FIXME: Foo::Bar or Foo/Bar"]
+  def direct_imports(lines)
     import_lines = lines.grep(/^\s*import[\s"\(]/)
     import_lines.map do |line|
       line.chomp!
@@ -371,7 +405,8 @@ module BuildOrder
     end
   end
 
-  def self.included_files(lines)
+  # return ["lan/dialogs", "lan/routines"]
+  def direct_includes(lines)
     include_lines = lines.grep(/^\s*include[\s"\(]/)
 
     include_lines.map do |line|
@@ -382,20 +417,48 @@ module BuildOrder
     end
   end
 
-  def self.fill_module_deps(modules, includes)
+
+
+  # return { :imports =>  ["Report", "Popup", "FIXME: Foo::Bar or Foo/Bar"],
+  #          :includes => ["lan/dialogs", "lan/routines"] }
+  # deps outside of this package are filtered
+  # duplicates are filtered
+  def direct_dependencies(full_path)
+    lines = File.readlines full_path
+    local_imports =  direct_imports(lines).select {|m| @modules[m] }
+    local_includes = direct_includes(lines).select {|i| @includes[i] }
+    { :imports =>  local_imports.uniq,
+      :includes => local_includes.uniq }
+  end
+
+  def fill_direct_dependencies
+  def fill_module_deps
     modules.each do |name, mod|
-      lines = File.readlines mod[:full_path]
-      deps = extract_imported_module_files lines
-      included = included_files lines
-      included.each do
-        next unless includes[name]
-        includes[name][:deps] ||= extract_imported_module_files(File.readlines(includes[name][:full_path]))
-        deps.concated includes[name][:deps]
-      end
-      deps = deps.select { |m| modules[m] }.uniq
-      mod[:deps] = deps
+      fill_mod_deps(mod)
     end
   end
+
+  def fill_mod_deps(mod)
+
+
+
+      direct_deps = direct_dependencies mod[:full_path]
+      mod_deps = direct_deps[:imports]
+
+      included.each do
+        next unless includes[name]
+        includes[name][:deps] ||= direct_imports(File.readlines(includes[name][:full_path]))
+        deps.concat includes[name][:deps]
+      end
+      # limit deps only to this package
+      deps = deps.select { |m| modules[m] }
+      mod[:deps] = deps.uniq
+    end
+  end
+
+  def fill_module_deps_via_includes(one_module)
+  end
+
 
   def self.find_module_to_process(modules, unprocessed, already_processed)
     unprocessed.find do |name|
